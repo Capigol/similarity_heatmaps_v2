@@ -26,14 +26,11 @@ from collections import Counter
 # =========================
 MAX_MOLECULES = 1000
 
-st.set_page_config(page_title="Structural Diversity App", layout="wide")
+st.set_page_config(page_title="Similarity Heatmaps", layout="wide")
 
 st.title("Structural Diversity Analysis Platform")
 
-# =========================
-# PAPER MODE FLAG
-# =========================
-paper_mode = st.toggle("📄 Paper Mode (high-resolution export)", value=False)
+paper_mode = st.toggle("📄 Paper export mode", value=False)
 
 # =========================
 # LOAD DATA
@@ -43,7 +40,7 @@ uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
 else:
-    st.info("No file uploaded → using local example_dataset.csv")
+    st.info("Using example_dataset.csv")
     df = pd.read_csv("example_dataset.csv")
 
 # =========================
@@ -77,7 +74,6 @@ df = df.iloc[valid_idx].reset_index(drop=True)
 st.write(f"Valid SMILES: {len(df)}")
 st.write(f"Invalid SMILES removed: {invalid}")
 
-# IMPORTANT FIX
 df["CLASS"] = df["CLASS"].astype(int)
 
 classes = df.CLASS.values
@@ -109,17 +105,16 @@ def sim_matrix(fps):
 sim = sim_matrix(fps)
 
 # =========================
-# HEATMAP
+# HEATMAP (UI SMALL + EXPORT LARGE)
 # =========================
 st.subheader("Clustered Heatmap")
 
 st.markdown("""
-This map shows pairwise Tanimoto similarity clustered hierarchically.
+Pairwise Tanimoto similarity clustered hierarchically.
 
-Interpretation:
-- bright blocks → chemical neighborhoods
-- dendrogram ordering → structural grouping
-- class stripes → enrichment patterns
+- blocks = structural similarity groups  
+- dendrogram = clustering order  
+- colors = class labels  
 """)
 
 dist = 1 - sim
@@ -127,6 +122,7 @@ link = linkage(squareform(dist, checks=False), method="average")
 
 colors = pd.Series(classes).map({0:"#1f77b4", 1:"#d62728"}).values
 
+# SMALL FIGURE FOR UI
 fig = sns.clustermap(
     sim,
     row_linkage=link,
@@ -136,10 +132,24 @@ fig = sns.clustermap(
     cmap="viridis",
     xticklabels=False,
     yticklabels=False,
-    figsize=(8,8)
+    figsize=(6, 6)
 )
 
 st.pyplot(fig)
+
+# =========================
+# EXPORT HEATMAP (HIGH RES)
+# =========================
+buf = BytesIO()
+fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+buf.seek(0)
+
+st.download_button(
+    "⬇️ Download heatmap (300 DPI PNG)",
+    data=buf,
+    file_name="heatmap.png",
+    mime="image/png"
+)
 
 # =========================
 # STAT TEST
@@ -157,30 +167,46 @@ v10 = sim10.flatten()
 
 _, pval = mannwhitneyu(v11, v10, alternative="greater")
 
-st.markdown("""
-We compare intra-class vs inter-class similarity distributions.
-
-⚠️ Important: statistical significance ≠ biological relevance.
-""")
-
 st.write(f"p-value: {pval:.3e}")
 
 # =========================
-# SCAFFOLDS (BIG SVG GRID)
+# DISTRIBUTIONS
+# =========================
+st.subheader("Similarity distributions")
+
+fig2, ax = plt.subplots()
+
+sns.kdeplot(v11, label="1–1", fill=True, ax=ax)
+sns.kdeplot(v10, label="1–0", fill=True, ax=ax)
+
+ax.legend()
+st.pyplot(fig2)
+
+# =========================
+# UMAP
+# =========================
+st.subheader("UMAP projection")
+
+fp_array = np.array([list(fp) for fp in fps])
+emb = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="jaccard").fit_transform(fp_array)
+
+fig3, ax = plt.subplots(figsize=(6, 5))
+ax.scatter(emb[:, 0], emb[:, 1], c=classes, cmap="coolwarm", s=20)
+st.pyplot(fig3)
+
+# =========================
+# SCAFFOLDS (FIXED, NO SVG)
 # =========================
 st.subheader("Scaffold diversity (Murcko scaffolds)")
 
 def get_scaffolds(smiles):
-    mols = []
-    labels = []
     counts = Counter()
 
     for smi in smiles:
         mol = Chem.MolFromSmiles(smi)
         if mol:
             scaf = MurckoScaffold.GetScaffoldForMol(mol)
-            scaf_smi = Chem.MolToSmiles(scaf)
-            counts[scaf_smi] += 1
+            counts[Chem.MolToSmiles(scaf)] += 1
 
     top = counts.most_common(5)
 
@@ -194,8 +220,8 @@ def draw_scaffolds(mols, labels):
         mols,
         legends=labels,
         molsPerRow=1,
-        subImgSize=(450, 450),
-        useSVG=True
+        subImgSize=(400, 400),
+        useSVG=False
     )
 
 m1, l1 = get_scaffolds(df[df.CLASS == 1].SMILES_STANDARDIZED)
@@ -205,11 +231,11 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("### Class 1")
-    st.image(draw_scaffolds(m1, l1), use_container_width=True)
+    st.image(draw_scaffolds(m1, l1))
 
 with col2:
     st.markdown("### Class 0")
-    st.image(draw_scaffolds(m0, l0), use_container_width=True)
+    st.image(draw_scaffolds(m0, l0))
 
 # =========================
 # PHYSICOCHEMICAL PROPERTIES
@@ -234,7 +260,7 @@ def calc_props(smiles):
 
 props = calc_props(smiles)
 
-fig, axes = plt.subplots(1, 5, figsize=(18, 3))
+fig4, axes = plt.subplots(1, 5, figsize=(16, 3))
 
 for i in range(5):
     axes[i].boxplot([
@@ -244,10 +270,10 @@ for i in range(5):
     axes[i].set_title(props_names[i])
     axes[i].set_xticklabels(["0", "1"])
 
-st.pyplot(fig)
+st.pyplot(fig4)
 
 # =========================
-# PHYSICOCHEM STATS TABLE
+# STAT SUMMARY TABLE
 # =========================
 st.subheader("Physicochemical statistical summary")
 
@@ -257,41 +283,8 @@ for i, name in enumerate(props_names):
     p0 = props[classes == 0][:, i]
     p1 = props[classes == 1][:, i]
 
-    _, p = mannwhitneyu(p1, p0, alternative="two-sided")
+    _, p = mannwhitneyu(p1, p0)
 
-    rows.append([
-        name,
-        np.mean(p0),
-        np.mean(p1),
-        p
-    ])
+    rows.append([name, np.mean(p0), np.mean(p1), p])
 
-stats_df = pd.DataFrame(rows, columns=["Property", "Mean Class 0", "Mean Class 1", "p-value"])
-
-st.dataframe(stats_df)
-
-# =========================
-# PAPER MODE EXPORT
-# =========================
-if paper_mode:
-
-    st.subheader("📄 Paper Export")
-
-    buffer = BytesIO()
-
-    fig.savefig(buffer, format="png", dpi=300, bbox_inches="tight")
-    buffer.seek(0)
-
-    b64 = base64.b64encode(buffer.read()).decode()
-
-    href = f'<a href="data:file/png;base64,{b64}" download="heatmap.png">Download Heatmap (PNG)</a>'
-
-    st.markdown(href, unsafe_allow_html=True)
-
-    st.markdown("""
-### Suggested interpretation (auto-generated)
-
-- Structural similarity shows moderate intra-class enrichment
-- Scaffold diversity indicates multiple chemotypes per class
-- Physicochemical properties show partial but not decisive separation
-""")
+st.dataframe(pd.DataFrame(rows, columns=["Property", "Mean 0", "Mean 1", "p-value"]))
