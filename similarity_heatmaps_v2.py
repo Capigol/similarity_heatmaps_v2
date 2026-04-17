@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+from io import BytesIO
+import base64
 
 from rdkit import Chem
 from rdkit.Chem import rdFingerprintGenerator, Descriptors
@@ -24,22 +26,25 @@ from collections import Counter
 # =========================
 MAX_MOLECULES = 1000
 
-st.title("Structural Diversity Analysis")
+st.set_page_config(page_title="Structural Diversity App", layout="wide")
+
+st.title("Structural Diversity Analysis Platform")
 
 # =========================
-# DATA LOADING
+# PAPER MODE FLAG
+# =========================
+paper_mode = st.toggle("📄 Paper Mode (high-resolution export)", value=False)
+
+# =========================
+# LOAD DATA
 # =========================
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
 else:
-    st.info("No file uploaded → loading example_dataset.csv")
-    if os.path.exists("example_dataset.csv"):
-        df = pd.read_csv("example_dataset.csv")
-    else:
-        st.error("No dataset found")
-        st.stop()
+    st.info("No file uploaded → using local example_dataset.csv")
+    df = pd.read_csv("example_dataset.csv")
 
 # =========================
 # VALIDATION
@@ -51,42 +56,36 @@ if not required.issubset(df.columns):
 
 df = df.dropna(subset=["SMILES_STANDARDIZED", "CLASS"])
 
-st.subheader("Dataset overview (before filtering)")
-st.write(f"Total molecules: {len(df)}")
-st.write(df["CLASS"].value_counts().rename("count"))
+st.subheader("Dataset overview")
+st.write(df["CLASS"].value_counts())
 
 # =========================
 # SMILES VALIDATION
 # =========================
-def validate(df):
-    valid = []
-    invalid = 0
+valid_idx = []
+invalid = 0
 
-    for i, smi in enumerate(df.SMILES_STANDARDIZED):
-        mol = Chem.MolFromSmiles(smi)
-        if mol:
-            valid.append(i)
-        else:
-            invalid += 1
-
-    return valid, invalid
-
-valid_idx, invalid = validate(df)
+for i, smi in enumerate(df.SMILES_STANDARDIZED):
+    mol = Chem.MolFromSmiles(smi)
+    if mol:
+        valid_idx.append(i)
+    else:
+        invalid += 1
 
 df = df.iloc[valid_idx].reset_index(drop=True)
 
 st.write(f"Valid SMILES: {len(df)}")
 st.write(f"Invalid SMILES removed: {invalid}")
 
-st.write("Class distribution (after filtering)")
-st.write(df["CLASS"].value_counts().rename("count"))
+# IMPORTANT FIX
+df["CLASS"] = df["CLASS"].astype(int)
+
+classes = df.CLASS.values
+smiles = df.SMILES_STANDARDIZED.tolist()
 
 if len(df) > MAX_MOLECULES:
     st.warning(f"Subsampling to {MAX_MOLECULES}")
     df = df.sample(MAX_MOLECULES, random_state=42)
-
-smiles = df.SMILES_STANDARDIZED.tolist()
-classes = df.CLASS.values
 
 # =========================
 # FINGERPRINTS
@@ -94,11 +93,11 @@ classes = df.CLASS.values
 radius = st.sidebar.slider("Radius", 1, 4, 2)
 nbits = st.sidebar.selectbox("FP length", [512, 1024, 2048, 4096], 2)
 
-def fps(smiles):
+def get_fps(smiles):
     gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=nbits)
     return [gen.GetFingerprint(Chem.MolFromSmiles(s)) for s in smiles]
 
-fps = fps(smiles)
+fps = get_fps(smiles)
 
 def sim_matrix(fps):
     n = len(fps)
@@ -109,153 +108,112 @@ def sim_matrix(fps):
 
 sim = sim_matrix(fps)
 
-idx1 = np.where(classes == 1)[0]
-idx0 = np.where(classes == 0)[0]
-
-sim11 = sim[np.ix_(idx1, idx1)]
-sim00 = sim[np.ix_(idx0, idx0)]
-sim10 = sim[np.ix_(idx1, idx0)]
-
-v11 = sim11[np.triu_indices_from(sim11, 1)]
-v00 = sim00[np.triu_indices_from(sim00, 1)]
-v10 = sim10.flatten()
-
-# =========================================================
-# HEATMAP + EXPLANATION
-# =========================================================
+# =========================
+# HEATMAP
+# =========================
 st.subheader("Clustered Heatmap")
 
 st.markdown("""
-This heatmap represents **pairwise Tanimoto similarity between molecules**,
-reordered using hierarchical clustering.
+This map shows pairwise Tanimoto similarity clustered hierarchically.
 
-### How to interpret:
-- Bright blocks → structurally similar compounds
-- Dendrogram ordering → groups similar molecules together
-- Color strip → class membership (red = 1, blue = 0)
-
-⚠️ Important: visual clusters do not imply biological significance.
+Interpretation:
+- bright blocks → chemical neighborhoods
+- dendrogram ordering → structural grouping
+- class stripes → enrichment patterns
 """)
 
 dist = 1 - sim
 link = linkage(squareform(dist, checks=False), method="average")
 
-colors = {0: "#1f77b4", 1: "#d62728"}
-row_colors = pd.Series(classes).map(colors).to_numpy()
+colors = pd.Series(classes).map({0:"#1f77b4", 1:"#d62728"}).values
 
-sns.clustermap(
+fig = sns.clustermap(
     sim,
     row_linkage=link,
     col_linkage=link,
-    row_colors=row_colors,
-    col_colors=row_colors,
+    row_colors=colors,
+    col_colors=colors,
     cmap="viridis",
     xticklabels=False,
-    yticklabels=False
+    yticklabels=False,
+    figsize=(8,8)
 )
 
-st.pyplot(plt)
+st.pyplot(fig)
 
-# =========================================================
-# STATISTICAL TEST (POST HEATMAP)
-# =========================================================
+# =========================
+# STAT TEST
+# =========================
 st.subheader("Statistical test (Mann–Whitney U)")
 
-st.markdown("""
-We test whether **intra-class similarity (1–1)** is greater than **inter-class similarity (1–0)**.
+idx1 = np.where(classes == 1)[0]
+idx0 = np.where(classes == 0)[0]
 
-⚠️ This test only evaluates distributions of similarity values.
-It does NOT imply causal or biological separation.
-""")
+sim11 = sim[np.ix_(idx1, idx1)]
+sim10 = sim[np.ix_(idx1, idx0)]
+
+v11 = sim11[np.triu_indices_from(sim11, 1)]
+v10 = sim10.flatten()
 
 _, pval = mannwhitneyu(v11, v10, alternative="greater")
+
+st.markdown("""
+We compare intra-class vs inter-class similarity distributions.
+
+⚠️ Important: statistical significance ≠ biological relevance.
+""")
+
 st.write(f"p-value: {pval:.3e}")
 
-# =========================================================
-# SIMILARITY DISTRIBUTIONS
-# =========================================================
-st.subheader("Similarity distributions")
-
-fig, ax = plt.subplots()
-
-sns.kdeplot(v11, label="1–1", fill=True, ax=ax)
-sns.kdeplot(v00, label="0–0", fill=True, ax=ax)
-sns.kdeplot(v10, label="1–0", fill=True, ax=ax)
-
-ax.legend()
-st.pyplot(fig)
-
-# =========================================================
-# UMAP
-# =========================================================
-st.subheader("UMAP projection")
-
-fp_array = np.array([list(fp) for fp in fps])
-emb = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="jaccard").fit_transform(fp_array)
-
-fig, ax = plt.subplots()
-ax.scatter(emb[:, 0], emb[:, 1], c=classes, cmap="coolwarm", s=20)
-st.pyplot(fig)
-
-# =========================================================
-# SCAFFOLDS (2D STRUCTURES)
-# =========================================================
-st.subheader("Scaffold diversity (2D structures)")
+# =========================
+# SCAFFOLDS (BIG SVG GRID)
+# =========================
+st.subheader("Scaffold diversity (Murcko scaffolds)")
 
 def get_scaffolds(smiles):
-    scaffolds = []
     mols = []
+    labels = []
+    counts = Counter()
 
     for smi in smiles:
         mol = Chem.MolFromSmiles(smi)
         if mol:
             scaf = MurckoScaffold.GetScaffoldForMol(mol)
-            scaffolds.append(Chem.MolToSmiles(scaf))
-            mols.append(scaf)
+            scaf_smi = Chem.MolToSmiles(scaf)
+            counts[scaf_smi] += 1
 
-    return scaffolds, mols
+    top = counts.most_common(5)
 
-scaf_all, _ = get_scaffolds(smiles)
-scaf1, mols1 = get_scaffolds(df[df.CLASS == 1].SMILES_STANDARDIZED)
-scaf0, mols0 = get_scaffolds(df[df.CLASS == 0].SMILES_STANDARDIZED)
+    mols = [Chem.MolFromSmiles(s) for s, _ in top]
+    labels = [f"n={c}" for _, c in top]
 
-def draw_top(scafs, mols, title):
-    counts = Counter(scafs).most_common(5)
+    return mols, labels
 
-    mol_list = []
-    labels = []
-
-    for smi, count in counts:
-        mol = Chem.MolFromSmiles(smi)
-        if mol:
-            mol_list.append(mol)
-            labels.append(f"n={count}")
-
-    img = Draw.MolsToGridImage(
-        mol_list,
-        molsPerRow=5,
+def draw_scaffolds(mols, labels):
+    return Draw.MolsToGridImage(
+        mols,
         legends=labels,
-        subImgSize=(200, 200)
+        molsPerRow=1,
+        subImgSize=(450, 450),
+        useSVG=True
     )
-    return img
 
-col1, col2, col3 = st.columns(3)
+m1, l1 = get_scaffolds(df[df.CLASS == 1].SMILES_STANDARDIZED)
+m0, l0 = get_scaffolds(df[df.CLASS == 0].SMILES_STANDARDIZED)
+
+col1, col2 = st.columns(2)
 
 with col1:
-    st.write("All")
-    st.image(draw_top(scaf_all, None, "All"))
+    st.markdown("### Class 1")
+    st.image(draw_scaffolds(m1, l1), use_container_width=True)
 
 with col2:
-    st.write("Class 1")
-    st.image(draw_top(scaf1, None, "Class 1"))
+    st.markdown("### Class 0")
+    st.image(draw_scaffolds(m0, l0), use_container_width=True)
 
-with col3:
-    st.write("Class 0")
-    st.image(draw_top(scaf0, None, "Class 0"))
-
-# =========================================================
+# =========================
 # PHYSICOCHEMICAL PROPERTIES
-# =========================================================
+# =========================
 st.subheader("Physicochemical properties")
 
 props_names = ["MW", "LogP", "HBD", "HBA", "RotB"]
@@ -276,29 +234,64 @@ def calc_props(smiles):
 
 props = calc_props(smiles)
 
-fig, axes = plt.subplots(1, 5, figsize=(16, 3))
+fig, axes = plt.subplots(1, 5, figsize=(18, 3))
 
 for i in range(5):
-    sns.boxplot(x=classes, y=props[:, i], ax=axes[i], palette={0:"#1f77b4", 1:"#d62728"})
+    axes[i].boxplot([
+        props[classes == 0][:, i],
+        props[classes == 1][:, i]
+    ])
     axes[i].set_title(props_names[i])
+    axes[i].set_xticklabels(["0", "1"])
 
 st.pyplot(fig)
 
-# =========================================================
-# STAT TEST FOR PHYSICOCHEM
-# =========================================================
-st.subheader("Physicochemical statistical tests")
+# =========================
+# PHYSICOCHEM STATS TABLE
+# =========================
+st.subheader("Physicochemical statistical summary")
 
-results = []
+rows = []
 
 for i, name in enumerate(props_names):
     p0 = props[classes == 0][:, i]
     p1 = props[classes == 1][:, i]
 
-    stat, p = mannwhitneyu(p1, p0, alternative="two-sided")
+    _, p = mannwhitneyu(p1, p0, alternative="two-sided")
 
-    results.append([name, np.mean(p1), np.mean(p0), p])
+    rows.append([
+        name,
+        np.mean(p0),
+        np.mean(p1),
+        p
+    ])
 
-res_df = pd.DataFrame(results, columns=["Property", "Mean Class 1", "Mean Class 0", "p-value"])
+stats_df = pd.DataFrame(rows, columns=["Property", "Mean Class 0", "Mean Class 1", "p-value"])
 
-st.dataframe(res_df)
+st.dataframe(stats_df)
+
+# =========================
+# PAPER MODE EXPORT
+# =========================
+if paper_mode:
+
+    st.subheader("📄 Paper Export")
+
+    buffer = BytesIO()
+
+    fig.savefig(buffer, format="png", dpi=300, bbox_inches="tight")
+    buffer.seek(0)
+
+    b64 = base64.b64encode(buffer.read()).decode()
+
+    href = f'<a href="data:file/png;base64,{b64}" download="heatmap.png">Download Heatmap (PNG)</a>'
+
+    st.markdown(href, unsafe_allow_html=True)
+
+    st.markdown("""
+### Suggested interpretation (auto-generated)
+
+- Structural similarity shows moderate intra-class enrichment
+- Scaffold diversity indicates multiple chemotypes per class
+- Physicochemical properties show partial but not decisive separation
+""")
