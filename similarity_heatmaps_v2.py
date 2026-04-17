@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 
@@ -14,7 +14,6 @@ from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
 from scipy.stats import mannwhitneyu
 
-from sklearn.manifold import TSNE
 import umap
 
 from collections import Counter
@@ -28,6 +27,27 @@ MAX_MOLECULES = 1000
 # UI
 # =========================
 st.title("Structural Diversity Analysis")
+
+st.markdown("""
+## What does this app do?
+
+This application analyzes **structural diversity** in a molecular dataset using:
+
+- **Morgan fingerprints (ECFP-like)**
+- **Tanimoto similarity**
+- **Clustering and visualization**
+
+### Key analyses:
+- Intra- vs inter-class similarity
+- Nearest neighbor similarity
+- Scaffold diversity (Murcko scaffolds)
+- UMAP projection
+
+### Important:
+This is an exploratory tool. Interpret results carefully.
+""")
+
+st.warning("Low similarity differences do NOT imply absence of biological signal.")
 
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
@@ -73,8 +93,9 @@ def nearest_neighbor(sim):
     return sim.max(axis=1)
 
 
-def scaffold_metrics(smiles):
+def scaffold_metrics_full(smiles):
     scaffolds = []
+
     for smi in smiles:
         mol = Chem.MolFromSmiles(smi)
         if mol:
@@ -83,12 +104,15 @@ def scaffold_metrics(smiles):
 
     counts = Counter(scaffolds)
     total = len(scaffolds)
+
     probs = np.array(list(counts.values())) / total
+    entropy = -np.sum(probs * np.log(probs))
 
     return {
         "n_scaffolds": len(counts),
-        "ratio": len(counts)/total,
-        "entropy": -np.sum(probs * np.log(probs))
+        "scaffold_ratio": len(counts) / total,
+        "entropy": entropy,
+        "top_scaffolds": counts.most_common(5)
     }
 
 # =========================
@@ -99,7 +123,7 @@ if uploaded_file and run:
     df = pd.read_csv(uploaded_file)
 
     if not {"SMILES_STANDARDIZED", "CLASS"}.issubset(df.columns):
-        st.error("Missing required columns")
+        st.error("CSV must contain 'SMILES_STANDARDIZED' and 'CLASS'")
         st.stop()
 
     df = df[['SMILES_STANDARDIZED', 'CLASS']].dropna()
@@ -115,10 +139,11 @@ if uploaded_file and run:
     fps, valid_idx, invalid = compute_fps(df['SMILES_STANDARDIZED'], radius, nbits)
 
     st.write(f"Valid molecules: {len(valid_idx)}")
-    st.write(f"Invalid SMILES: {invalid}")
+    st.write(f"Invalid SMILES removed: {invalid}")
 
     df = df.iloc[valid_idx].reset_index(drop=True)
     classes = df.CLASS.values
+    smiles = df.SMILES_STANDARDIZED.tolist()
 
     # =====================
     # SIMILARITY
@@ -137,7 +162,7 @@ if uploaded_file and run:
     v10 = sim10.flatten()
 
     # =====================
-    # STATS + TEST
+    # STATS
     # =====================
     stat, pval = mannwhitneyu(v11, v10, alternative="greater")
 
@@ -176,11 +201,13 @@ if uploaded_file and run:
 
     fig2, ax = plt.subplots()
 
-    sns.kdeplot(v11, label="1-1", fill=True, ax=ax)
-    sns.kdeplot(v00, label="0-0", fill=True, ax=ax)
-    sns.kdeplot(v10, label="1-0", fill=True, ax=ax)
+    sns.kdeplot(v11, label="Class 1-1", fill=True, ax=ax)
+    sns.kdeplot(v00, label="Class 0-0", fill=True, ax=ax)
+    sns.kdeplot(v10, label="Class 1-0", fill=True, ax=ax)
 
     ax.legend()
+    ax.set_xlabel("Tanimoto similarity")
+
     st.pyplot(fig2)
 
     # =====================
@@ -189,41 +216,47 @@ if uploaded_file and run:
     st.subheader("UMAP projection")
 
     fp_array = np.array([list(fp) for fp in fps])
-
     reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="jaccard")
     emb = reducer.fit_transform(fp_array)
 
     fig3, ax = plt.subplots()
-    ax.scatter(emb[:,0], emb[:,1], c=classes)
+    scatter = ax.scatter(emb[:,0], emb[:,1], c=classes)
     st.pyplot(fig3)
 
     # =====================
-    # METRICS TABLE
+    # SCAFFOLDS
+    # =====================
+    st.subheader("Scaffold diversity")
+
+    scaf_all = scaffold_metrics_full(smiles)
+    scaf_1 = scaffold_metrics_full(df[df.CLASS == 1]['SMILES_STANDARDIZED'])
+    scaf_0 = scaffold_metrics_full(df[df.CLASS == 0]['SMILES_STANDARDIZED'])
+
+    scaffold_df = pd.DataFrame([
+        {"group": "All", **{k:v for k,v in scaf_all.items() if k != "top_scaffolds"}},
+        {"group": "Class 1", **{k:v for k,v in scaf_1.items() if k != "top_scaffolds"}},
+        {"group": "Class 0", **{k:v for k,v in scaf_0.items() if k != "top_scaffolds"}},
+    ])
+
+    st.dataframe(scaffold_df)
+
+    st.write("### Top scaffolds")
+
+    for name, scaf in zip(
+        ["All", "Class 1", "Class 0"],
+        [scaf_all, scaf_1, scaf_0]
+    ):
+        st.write(f"**{name}**")
+        for s, c in scaf["top_scaffolds"]:
+            st.write(f"{s} → {c}")
+
+    # =====================
+    # DOWNLOAD
     # =====================
     results = pd.DataFrame({
         "group": ["class1", "class0", "inter"],
         "mean": [np.mean(v11), np.mean(v00), np.mean(v10)]
     })
 
-    st.subheader("Metrics")
-    st.dataframe(results)
-
-    # =====================
-    # DOWNLOAD
-    # =====================
     csv = results.to_csv(index=False).encode()
     st.download_button("Download metrics", csv, "metrics.csv")
-
-    # =====================
-    # INTERPRETATION
-    # =====================
-    st.subheader("Quick interpretation")
-
-    delta = np.mean(v11) - np.mean(v10)
-
-    if delta < 0.02:
-        st.warning("Very weak structural separation")
-    elif delta < 0.05:
-        st.info("Moderate separation")
-    else:
-        st.success("Strong structural enrichment")
