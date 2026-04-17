@@ -4,7 +4,7 @@ import numpy as np
 import os
 
 from rdkit import Chem
-from rdkit.Chem import rdFingerprintGenerator
+from rdkit.Chem import rdFingerprintGenerator, Descriptors
 from rdkit.DataStructs import BulkTanimotoSimilarity
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
@@ -26,48 +26,81 @@ MAX_MOLECULES = 1000
 st.title("Structural Diversity Analysis")
 
 # =========================
-# DATA LOADING
+# LOAD DATA
 # =========================
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded_file is not None:
     df = pd.read_csv(uploaded_file)
 else:
-    st.info("No file uploaded. Using example_dataset.csv from local directory.")
+    st.info("No file uploaded → loading example_dataset.csv")
     if os.path.exists("example_dataset.csv"):
         df = pd.read_csv("example_dataset.csv")
     else:
-        st.error("No example_dataset.csv found in directory.")
+        st.error("No dataset found.")
         st.stop()
 
 # =========================
-# CHECK COLUMNS
+# BASIC VALIDATION (MOVED TO TOP)
 # =========================
-if not {"SMILES_STANDARDIZED", "CLASS"}.issubset(df.columns):
-    st.error("CSV must contain 'SMILES_STANDARDIZED' and 'CLASS'")
+required = {"SMILES_STANDARDIZED", "CLASS"}
+
+if not required.issubset(df.columns):
+    st.error("Missing required columns: SMILES_STANDARDIZED, CLASS")
     st.stop()
 
-df = df[['SMILES_STANDARDIZED', 'CLASS']].dropna()
+df = df.dropna(subset=["SMILES_STANDARDIZED", "CLASS"])
 
-if len(df) > MAX_MOLECULES:
-    st.warning(f"Dataset too large ({len(df)}). Subsampling to {MAX_MOLECULES}")
-    df = df.sample(MAX_MOLECULES, random_state=42)
+# CLASS distribution BEFORE filtering
+st.subheader("Dataset overview (before filtering)")
+st.write(f"Total molecules: {len(df)}")
+st.write(df["CLASS"].value_counts().rename("count"))
 
 # =========================
-# FUNCTIONS
+# SMILES VALIDATION (IMPORTANT)
 # =========================
-def compute_fps(smiles, radius, nbits):
-    gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=nbits)
-    fps, valid_idx = [], []
+def validate_smiles(df):
+    valid_idx = []
+    invalid = 0
 
-    for i, smi in enumerate(smiles):
+    for i, smi in enumerate(df.SMILES_STANDARDIZED):
         mol = Chem.MolFromSmiles(smi)
         if mol:
-            fps.append(gen.GetFingerprint(mol))
             valid_idx.append(i)
+        else:
+            invalid += 1
 
-    return fps, valid_idx
+    return valid_idx, invalid
 
+valid_idx, invalid = validate_smiles(df)
+
+df = df.iloc[valid_idx].reset_index(drop=True)
+
+st.write(f"Valid SMILES: {len(df)}")
+st.write(f"Invalid SMILES removed: {invalid}")
+
+st.write("Class distribution (after filtering)")
+st.write(df["CLASS"].value_counts().rename("count"))
+
+# Subsample
+if len(df) > MAX_MOLECULES:
+    st.warning(f"Subsampling to {MAX_MOLECULES}")
+    df = df.sample(MAX_MOLECULES, random_state=42)
+
+smiles = df.SMILES_STANDARDIZED.tolist()
+classes = df.CLASS.values
+
+# =========================
+# FP + SIMILARITY
+# =========================
+radius = st.sidebar.slider("Radius", 1, 4, 2)
+nbits = st.sidebar.selectbox("FP length", [512, 1024, 2048, 4096], 2)
+
+def compute_fps(smiles, radius, nbits):
+    gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=nbits)
+    return [gen.GetFingerprint(Chem.MolFromSmiles(s)) for s in smiles]
+
+fps = compute_fps(smiles, radius, nbits)
 
 def tanimoto_matrix(fps):
     n = len(fps)
@@ -76,206 +109,157 @@ def tanimoto_matrix(fps):
         sim[i, :] = BulkTanimotoSimilarity(fps[i], fps)
     return sim
 
+sim = tanimoto_matrix(fps)
 
-def flatten_upper(mat):
-    return mat[np.triu_indices_from(mat, k=1)]
+idx1 = np.where(classes == 1)[0]
+idx0 = np.where(classes == 0)[0]
 
+sim11 = sim[np.ix_(idx1, idx1)]
+sim00 = sim[np.ix_(idx0, idx0)]
+sim10 = sim[np.ix_(idx1, idx0)]
 
-def scaffold_metrics(smiles):
+v11 = sim11[np.triu_indices_from(sim11, k=1)]
+v00 = sim00[np.triu_indices_from(sim00, k=1)]
+v10 = sim10.flatten()
+
+# =========================
+# HEATMAP
+# =========================
+st.subheader("Clustered Heatmap")
+
+st.markdown("""
+Pairwise Tanimoto similarity clustered by hierarchical clustering.
+
+Interpretation:
+- blocks = structural neighborhoods
+- color stripes = class labels
+- separation suggests structural enrichment
+""")
+
+dist = 1 - sim
+link = linkage(squareform(dist, checks=False), method="average")
+
+colors = {0: "#1f77b4", 1: "#d62728"}
+row_colors = pd.Series(classes).map(colors).to_numpy()
+
+sns.clustermap(
+    sim,
+    row_linkage=link,
+    col_linkage=link,
+    row_colors=row_colors,
+    col_colors=row_colors,
+    cmap="viridis",
+    xticklabels=False,
+    yticklabels=False
+)
+
+st.pyplot(plt)
+
+# =========================
+# STATISTICAL TEST (MOVED HERE)
+# =========================
+st.subheader("Statistical test (Mann–Whitney U)")
+
+st.markdown("""
+This test evaluates whether intra-class similarity (Class 1–1)
+is statistically higher than inter-class similarity (Class 1–0).
+
+⚠️ Interpretation:
+A small p-value suggests a tendency toward structural enrichment,
+but does NOT imply strong or biologically meaningful separation.
+""")
+
+_, pval = mannwhitneyu(v11, v10, alternative="greater")
+st.write(f"p-value: {pval:.3e}")
+
+# =========================
+# DISTRIBUTIONS
+# =========================
+st.subheader("Similarity distributions")
+
+fig, ax = plt.subplots()
+sns.kdeplot(v11, label="1-1", fill=True, ax=ax)
+sns.kdeplot(v00, label="0-0", fill=True, ax=ax)
+sns.kdeplot(v10, label="1-0", fill=True, ax=ax)
+ax.legend()
+st.pyplot(fig)
+
+# =========================
+# UMAP
+# =========================
+st.subheader("UMAP projection")
+
+fp_array = np.array([list(fp) for fp in fps])
+
+reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="jaccard")
+emb = reducer.fit_transform(fp_array)
+
+fig, ax = plt.subplots()
+ax.scatter(emb[:, 0], emb[:, 1], c=classes, cmap="coolwarm", s=20)
+st.pyplot(fig)
+
+# =========================
+# SCAFFOLDS (2D PLOT)
+# =========================
+st.subheader("Scaffold diversity (Murcko scaffolds)")
+
+def get_scaffolds(smiles):
     scaffolds = []
-
     for smi in smiles:
         mol = Chem.MolFromSmiles(smi)
         if mol:
             scaf = MurckoScaffold.GetScaffoldForMol(mol)
             scaffolds.append(Chem.MolToSmiles(scaf))
+    return Counter(scaffolds)
 
-    counts = Counter(scaffolds)
-    total = len(scaffolds)
+scaf1 = get_scaffolds(df[df.CLASS == 1].SMILES_STANDARDIZED)
+scaf0 = get_scaffolds(df[df.CLASS == 0].SMILES_STANDARDIZED)
 
-    return counts, total
+def plot_top(scaf, title):
+    top = scaf.most_common(5)
+    names = [f"S{i+1}" for i in range(len(top))]
+    counts = [c for _, c in top]
 
+    fig, ax = plt.subplots()
+    ax.barh(names, counts)
+    ax.set_title(title)
+    return fig
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.pyplot(plot_top(scaf1, "Class 1 top scaffolds"))
+
+with col2:
+    st.pyplot(plot_top(scaf0, "Class 0 top scaffolds"))
 
 # =========================
-# PARAMETERS
+# PHYSICOCHEMICAL PROPERTIES
 # =========================
-st.sidebar.header("Fingerprint parameters")
-radius = st.sidebar.slider("Radius", 1, 4, 2)
-nbits = st.sidebar.selectbox("FP length", [512, 1024, 2048, 4096], 2)
+st.subheader("Physicochemical properties")
 
-run = st.button("Run analysis")
+def calc_props(smiles):
+    props = []
+    for smi in smiles:
+        mol = Chem.MolFromSmiles(smi)
+        if mol:
+            props.append([
+                Descriptors.MolWt(mol),
+                Descriptors.MolLogP(mol),
+                Descriptors.NumHDonors(mol),
+                Descriptors.NumHAcceptors(mol),
+                Descriptors.NumRotatableBonds(mol)
+            ])
+    return np.array(props)
 
-# =========================
-# RUN
-# =========================
-if run:
+props = calc_props(smiles)
 
-    smiles = df.SMILES_STANDARDIZED.tolist()
-    classes = df.CLASS.values
+labels = ["MW", "LogP", "HBD", "HBA", "RotB"]
 
-    # =====================
-    # FINGERPRINTS
-    # =====================
-    fps, valid_idx = compute_fps(smiles, radius, nbits)
+fig, axes = plt.subplots(1, 5, figsize=(15, 3))
 
-    df = df.iloc[valid_idx].reset_index(drop=True)
-    classes = df.CLASS.values
-    smiles = df.SMILES_STANDARDIZED.tolist()
+for i in range(5):
+    sns.boxplot(x=classes, y=props[:, i], ax=axes[i])
+    axes[i].set_title(labels[i])
 
-    # =====================
-    # SIMILARITY
-    # =====================
-    sim = tanimoto_matrix(fps)
-
-    idx1 = np.where(classes == 1)[0]
-    idx0 = np.where(classes == 0)[0]
-
-    sim11 = sim[np.ix_(idx1, idx1)]
-    sim00 = sim[np.ix_(idx0, idx0)]
-    sim10 = sim[np.ix_(idx1, idx0)]
-
-    v11 = flatten_upper(sim11)
-    v00 = flatten_upper(sim00)
-    v10 = sim10.flatten()
-
-    # =========================
-    # STATISTICAL TEST
-    # =========================
-    st.subheader("Statistical test (Mann–Whitney U)")
-
-    st.markdown("""
-We compare whether **within-class similarity (Class 1–1)** is significantly higher than
-**between-class similarity (Class 1–0)** using a non-parametric Mann–Whitney test.
-
-This tests whether active compounds are structurally more similar to each other than to inactive ones.
-""")
-
-    stat, pval = mannwhitneyu(v11, v10, alternative="greater")
-
-    st.write(f"p-value: {pval:.3e}")
-
-    # =========================
-    # HEATMAP
-    # =========================
-    st.subheader("Clustered Heatmap")
-
-    st.markdown("""
-This heatmap shows **pairwise Tanimoto similarity between all molecules**, reordered by hierarchical clustering.
-
-How to read it:
-- Blocks of high intensity indicate structurally similar clusters
-- Row/column colors indicate class membership
-- If classes separate well, blocks will align with colors
-""")
-
-    dist = 1 - sim
-    link = linkage(squareform(dist, checks=False), method="average")
-
-    colors = {0: "#1f77b4", 1: "#d62728"}
-    row_colors = pd.Series(classes).map(colors).to_numpy()
-
-    fig = sns.clustermap(
-        sim,
-        row_linkage=link,
-        col_linkage=link,
-        row_colors=row_colors,
-        col_colors=row_colors,
-        cmap="viridis",
-        xticklabels=False,
-        yticklabels=False,
-        figsize=(8, 8)
-    )
-
-    st.pyplot(fig)
-
-    # =========================
-    # DISTRIBUTIONS
-    # =========================
-    st.subheader("Similarity distributions")
-
-    st.markdown("""
-These distributions show how similarity values are distributed across:
-- Class 1 vs Class 1 (intra-active)
-- Class 0 vs Class 0 (intra-inactive)
-- Class 1 vs Class 0 (inter-class)
-
-Separation between curves suggests structural differentiation between classes.
-""")
-
-    fig2, ax = plt.subplots()
-
-    sns.kdeplot(v11, label="Class 1-1", fill=True, ax=ax)
-    sns.kdeplot(v00, label="Class 0-0", fill=True, ax=ax)
-    sns.kdeplot(v10, label="Class 1-0", fill=True, ax=ax)
-
-    ax.legend()
-    st.pyplot(fig2)
-
-    # =========================
-    # UMAP
-    # =========================
-    st.subheader("UMAP projection")
-
-    st.markdown("""
-UMAP reduces high-dimensional fingerprint space into 2D.
-
-Each point represents a molecule.
-Proximity reflects structural similarity.
-""")
-
-    fp_array = np.array([list(fp) for fp in fps])
-    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="jaccard")
-    emb = reducer.fit_transform(fp_array)
-
-    fig3, ax = plt.subplots()
-    ax.scatter(emb[:, 0], emb[:, 1], c=classes, cmap="coolwarm", s=20)
-    st.pyplot(fig3)
-
-    # =========================
-    # SCAFFOLDS
-    # =========================
-    st.subheader("Scaffold diversity (Murcko scaffolds)")
-
-    st.markdown("""
-Scaffolds represent the **core molecular framework** of compounds.
-
-This analysis evaluates:
-- Structural diversity at the core level
-- Dominant chemical motifs in each class
-""")
-
-    counts_all, total_all = scaffold_metrics(smiles)
-    counts_1, total_1 = scaffold_metrics(df[df.CLASS == 1]['SMILES_STANDARDIZED'])
-    counts_0, total_0 = scaffold_metrics(df[df.CLASS == 0]['SMILES_STANDARDIZED'])
-
-    def top_table(counts, name):
-        top5 = counts.most_common(5)
-        return pd.DataFrame(top5, columns=[f"{name}_scaffold", "count"])
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.write("All")
-        st.dataframe(top_table(counts_all, "All"))
-
-    with col2:
-        st.write("Class 1")
-        st.dataframe(top_table(counts_1, "Class1"))
-
-    with col3:
-        st.write("Class 0")
-        st.dataframe(top_table(counts_0, "Class0"))
-
-    # =========================
-    # SUMMARY MESSAGE
-    # =========================
-    st.subheader("Key interpretation")
-
-    delta = np.mean(v11) - np.mean(v10)
-
-    if delta < 0.02:
-        st.warning("Very weak structural separation between classes")
-    elif delta < 0.05:
-        st.info("Moderate structural separation")
-    else:
-        st.success("Strong structural enrichment detected")
+st.pyplot(fig)
